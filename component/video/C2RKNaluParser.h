@@ -25,12 +25,16 @@ class C2RKNaluParser {
 public:
     static int32_t detectBitDepth(uint8_t *buf, int32_t size, int32_t coding);
     static int32_t detectMaxRefCount(uint8_t *buf, int32_t size, int32_t coding);
+    // coded picture size from an AVC SPS, AV1 sequence header or VP9 key frame
+    static bool detectResolution(
+            uint8_t *buf, int32_t size, int32_t coding, int32_t *width, int32_t *height);
 
 private:
     /* Supported lists for InputFormat */
     typedef enum {
         C2_DETECT_FIELD_DEPTH = 0,
         C2_DETECT_FIELD_MAX_REF_COUNT,
+        C2_DETECT_FIELD_RESOLUTION,
         C2_DETECT_FIELD_BUTT,
     } MyDetectField;
 
@@ -44,6 +48,12 @@ private:
             uint8_t *buf, int32_t size, int32_t detectFiled, int32_t *outValue);
     static bool searchHEVCNaluInfo(
             uint8_t *buf, int32_t size, int32_t detectFiled, int32_t *outValue);
+    static bool searchAVCResolution(
+            uint8_t *buf, int32_t size, int32_t *width, int32_t *height);
+    static bool searchAV1Resolution(
+            uint8_t *buf, int32_t size, int32_t *width, int32_t *height);
+    static bool searchVP9Resolution(
+            uint8_t *buf, int32_t size, int32_t *width, int32_t *height);
 };
 
 } // namespace android

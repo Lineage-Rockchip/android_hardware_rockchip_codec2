@@ -855,6 +855,7 @@ C2RKMpiDec::C2RKMpiDec(
       mSlotsToReduce(0),
       mPixelFormat(0),
       mScaleMode(0),
+      mCheckCodedSize(true),
       mFdPerf(-1),
       mStarted(false),
       mFlushed(true),
@@ -1052,6 +1053,7 @@ c2_status_t C2RKMpiDec::onFlush_sm() {
         mDumpService->resetNode(this);
 
         mFlushed = true;
+        mCheckCodedSize = true;
     }
 
     return C2_OK;
@@ -1790,6 +1792,67 @@ error:
     return C2_CORRUPTED;
 }
 
+c2_status_t C2RKMpiDec::restartDecoderForResolution(
+        const std::unique_ptr<C2Work> &work, int32_t width, int32_t height) {
+    c2_status_t err = C2_OK;
+
+    Log.I("coded size %dx%d -> %dx%d at stream (re)start, restart decoder",
+           mWidth, mHeight, width, height);
+
+    {
+        Mutex::Autolock autoLock(mBufferLock);
+        releaseAllBuffers();
+    }
+
+    if (mBufferGroup != nullptr) {
+        mpp_buffer_group_put(mBufferGroup);
+        mBufferGroup = nullptr;
+    }
+
+    if (mDecCfg != nullptr) {
+        mpp_dec_cfg_deinit(mDecCfg);
+        mDecCfg = nullptr;
+    }
+
+    if (mMppCtx) {
+        mpp_destroy(mMppCtx);
+        mMppCtx = nullptr;
+    }
+
+    mWidth = width;
+    mHeight = height;
+    mScaleMode = C2_SCALE_MODE_NONE;
+
+    err = initDecoder(work);
+    if (err != C2_OK) {
+        Log.E("failed to restart decoder for %dx%d", width, height);
+        return err;
+    }
+
+    getSurfaceFeatures(mBlockPool);
+
+    err = configOutputDelay(work);
+    if (err != C2_OK) {
+        Log.E("failed to update output delay");
+        return err;
+    }
+
+    {
+        C2StreamPictureSizeInfo::output size(0u, mWidth, mHeight);
+        std::vector<std::unique_ptr<C2SettingResult>> failures;
+        err = mIntf->config({&size}, C2_MAY_BLOCK, &failures);
+        if (err != C2_OK) {
+            Log.E("failed to set width and height");
+            return err;
+        }
+    }
+
+    updateAllocParams();
+    mDumpService->updateNode(this, mWidth, mHeight);
+
+    return C2_OK;
+}
+
 void C2RKMpiDec::setMppPerformance(bool on) {
     int32_t width     = 1920;
     int32_t height    = 1080;
@@ -1881,8 +1944,10 @@ void C2RKMpiDec::finishWork(
     }
 
     if (block) {
+        int32_t cropWidth  = entry.width  > 0 ? entry.width  : mWidth;
+        int32_t cropHeight = entry.height > 0 ? entry.height : mHeight;
         c2Buffer = createGraphicBuffer(
-                std::move(block), C2Rect(mWidth, mHeight).at(mLeftCorner, mTopCorner));
+                std::move(block), C2Rect(cropWidth, cropHeight).at(mLeftCorner, mTopCorner));
 
         if (mCodingType == MPP_VIDEO_CodingAVC ||
             mCodingType == MPP_VIDEO_CodingHEVC ||
@@ -2082,7 +2147,27 @@ void C2RKMpiDec::process(
     Log.D("in buffer attr. size %zu timestamp %lld frameindex %lld, flags %x",
            inSize, timestamp, frameIndex, flags);
 
-    if (mFlushed) {
+    bool restarted = false;
+    if (mCheckCodedSize) {
+        int32_t codedWidth = 0, codedHeight = 0;
+        if (!mTunneled && !mBufferMode && inSize > 0
+                && C2RKNaluParser::detectResolution(
+                        inData, inSize, mCodingType, &codedWidth, &codedHeight)
+                && (codedWidth != mWidth || codedHeight != mHeight)) {
+            err = restartDecoderForResolution(work, codedWidth, codedHeight);
+            if (err != C2_OK) {
+                mSignalledError = true;
+                work->result = C2_CORRUPTED;
+                return;
+            }
+            restarted = true;
+        }
+        if (!(flags & C2FrameData::FLAG_CODEC_CONFIG)) {
+            mCheckCodedSize = false;
+        }
+    }
+
+    if (mFlushed || restarted) {
         err = ensureDecoderState();
         if (err != C2_OK) {
             mSignalledError = true;
@@ -2748,6 +2833,10 @@ c2_status_t C2RKMpiDec::getoutframe(WorkEntry *entry) {
 
         entry->block = outBuffer->takeBlock();
     }
+
+    // xpp post-processing may return frames larger than the stream, e.g. AI-PQ upscaled to 1080p
+    entry->width  = width;
+    entry->height = height;
 
     if (mCodingType == MPP_VIDEO_CodingAVC ||
         mCodingType == MPP_VIDEO_CodingHEVC ||

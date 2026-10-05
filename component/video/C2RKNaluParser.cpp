@@ -56,7 +56,7 @@ bool C2RKNaluParser::searchAVCNaluInfo(
     BitReadContext *gb = &gbCtx;
     int32_t startCodeLen = 0;
     int32_t val = 0, i = 0;
-    int32_t profileIdc = 0, chromaFormatIdc = 0;
+    int32_t profileIdc = 0, chromaFormatIdc = 1;
 
     c2_set_bitread_ctx(gb, buf, size);
     c2_set_pre_detection(gb);
@@ -199,6 +199,44 @@ bool C2RKNaluParser::searchAVCNaluInfo(
     if (detectFiled == C2_DETECT_FIELD_MAX_REF_COUNT) {
         Log.D("get AVC stream maxRefCount %d", val);
         *outValue = val;
+        return true;
+    }
+
+    if (detectFiled == C2_DETECT_FIELD_RESOLUTION) {
+        int32_t widthMbs = 0, heightMapUnits = 0, frameMbsOnly = 0, cropping = 0;
+        int32_t cropLeft = 0, cropRight = 0, cropTop = 0, cropBottom = 0;
+        int32_t cropUnitX = 1, cropUnitY = 1;
+
+        SKIP_BITS(gb, 1);  // gaps_in_frame_num_value_allowed_flag
+        READ_UE(gb, &widthMbs);  // pic_width_in_mbs_minus1
+        READ_UE(gb, &heightMapUnits);  // pic_height_in_map_units_minus1
+        READ_ONEBIT(gb, &frameMbsOnly);  // frame_mbs_only_flag
+        if (!frameMbsOnly) {
+            SKIP_BITS(gb, 1);  // mb_adaptive_frame_field_flag
+        }
+        SKIP_BITS(gb, 1);  // direct_8x8_inference_flag
+        READ_ONEBIT(gb, &cropping);  // frame_cropping_flag
+        if (cropping) {
+            READ_UE(gb, &cropLeft);
+            READ_UE(gb, &cropRight);
+            READ_UE(gb, &cropTop);
+            READ_UE(gb, &cropBottom);
+        }
+
+        if (chromaFormatIdc == 1 || chromaFormatIdc == 2) {
+            cropUnitX = 2;
+        }
+        cropUnitY = ((chromaFormatIdc == 1) ? 2 : 1) * (2 - frameMbsOnly);
+
+        int32_t width  = (widthMbs + 1) * 16 - cropUnitX * (cropLeft + cropRight);
+        int32_t height = (2 - frameMbsOnly) * (heightMapUnits + 1) * 16
+                         - cropUnitY * (cropTop + cropBottom);
+        if (width <= 0 || height <= 0 || width > 0xffff || height > 0xffff) {
+            goto __BR_ERR;
+        }
+
+        Log.D("get AVC stream resolution %dx%d", width, height);
+        *outValue = (width << 16) | height;
         return true;
     }
 
@@ -519,6 +557,278 @@ int32_t C2RKNaluParser::detectMaxRefCount(uint8_t *buf, int32_t size, int32_t co
         } break;
     }
     return maxRefCount;
+}
+
+namespace {
+
+/* plain MSB-first reader for AV1 and VP9 headers, which have no emulation prevention */
+struct C2RKPlainBits {
+    const uint8_t *data;
+    int64_t        bits;
+    int64_t        pos;
+    bool           overrun;
+
+    C2RKPlainBits(const uint8_t *buf, int32_t size)
+        : data(buf), bits((int64_t)size * 8), pos(0), overrun(false) {}
+
+    uint32_t read(int32_t n) {
+        uint32_t v = 0;
+        while (n-- > 0) {
+            if (pos >= bits) {
+                overrun = true;
+                return 0;
+            }
+            v = (v << 1) | ((data[pos >> 3] >> (7 - (pos & 7))) & 1);
+            pos++;
+        }
+        return v;
+    }
+
+    uint32_t readUvlc() {
+        int32_t leadingZeros = 0;
+        while (!overrun && !read(1)) {
+            if (++leadingZeros >= 32) {
+                overrun = true;
+                return 0;
+            }
+        }
+        if (leadingZeros == 0) {
+            return 0;
+        }
+        return read(leadingZeros) + (1u << leadingZeros) - 1;
+    }
+};
+
+bool readLeb128(const uint8_t *buf, int32_t size, int32_t *consumed, uint64_t *value) {
+    uint64_t v = 0;
+    for (int32_t i = 0; i < 8 && i < size; i++) {
+        v |= (uint64_t)(buf[i] & 0x7f) << (i * 7);
+        if (!(buf[i] & 0x80)) {
+            *consumed = i + 1;
+            *value = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parseAV1SequenceHeader(
+        const uint8_t *buf, int32_t size, int32_t *width, int32_t *height) {
+    C2RKPlainBits br(buf, size);
+
+    br.read(3);  // seq_profile
+    br.read(1);  // still_picture
+    uint32_t reducedStillPictureHeader = br.read(1);
+
+    if (reducedStillPictureHeader) {
+        br.read(5);  // seq_level_idx[0]
+    } else {
+        uint32_t decoderModelInfoPresent = 0;
+        uint32_t bufferDelayLength = 0;
+
+        if (br.read(1)) {  // timing_info_present_flag
+            br.read(32);  // num_units_in_display_tick
+            br.read(32);  // time_scale
+            if (br.read(1)) {  // equal_picture_interval
+                br.readUvlc();  // num_ticks_per_picture_minus_1
+            }
+            decoderModelInfoPresent = br.read(1);
+            if (decoderModelInfoPresent) {
+                bufferDelayLength = br.read(5) + 1;
+                br.read(32);  // num_units_in_decoding_tick
+                br.read(5);  // buffer_removal_time_length_minus_1
+                br.read(5);  // frame_presentation_time_length_minus_1
+            }
+        }
+
+        uint32_t initialDisplayDelayPresent = br.read(1);
+        uint32_t operatingPoints = br.read(5) + 1;
+        for (uint32_t i = 0; i < operatingPoints && !br.overrun; i++) {
+            br.read(12);  // operating_point_idc
+            if (br.read(5) > 7) {  // seq_level_idx
+                br.read(1);  // seq_tier
+            }
+            if (decoderModelInfoPresent && br.read(1)) {
+                br.read(bufferDelayLength);  // decoder_buffer_delay
+                br.read(bufferDelayLength);  // encoder_buffer_delay
+                br.read(1);  // low_delay_mode_flag
+            }
+            if (initialDisplayDelayPresent && br.read(1)) {
+                br.read(4);  // initial_display_delay_minus_1
+            }
+        }
+    }
+
+    int32_t widthBits  = br.read(4) + 1;
+    int32_t heightBits = br.read(4) + 1;
+    int32_t w = (int32_t)br.read(widthBits) + 1;
+    int32_t h = (int32_t)br.read(heightBits) + 1;
+
+    if (br.overrun || w <= 1 || h <= 1) {
+        return false;
+    }
+
+    *width = w;
+    *height = h;
+    return true;
+}
+
+}  // namespace
+
+bool C2RKNaluParser::searchAVCResolution(
+        uint8_t *buf, int32_t size, int32_t *width, int32_t *height) {
+    for (int32_t i = 0; i + 4 < size; i++) {
+        if (buf[i] != 0 || buf[i + 1] != 0 || buf[i + 2] != 1) {
+            continue;
+        }
+        if ((buf[i + 3] & 0x1f) == H264_NALU_TYPE_SPS) {
+            int32_t value = 0;
+            if (searchAVCNaluInfo(buf + i, size - i, C2_DETECT_FIELD_RESOLUTION, &value)) {
+                *width = value >> 16;
+                *height = value & 0xffff;
+                return true;
+            }
+        }
+        i += 2;
+    }
+
+    /* AVC extraData configuration (avcC) */
+    if (size > 8 && buf[0] == 1) {
+        int32_t value = 0;
+        if (searchAVCNaluInfo(buf, size, C2_DETECT_FIELD_RESOLUTION, &value)) {
+            *width = value >> 16;
+            *height = value & 0xffff;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool C2RKNaluParser::searchAV1Resolution(
+        uint8_t *buf, int32_t size, int32_t *width, int32_t *height) {
+    int32_t pos = 0;
+
+    /* AV1CodecConfigurationRecord: marker 1, version 1, then configOBUs */
+    if (size > 4 && buf[0] == 0x81) {
+        pos = 4;
+    }
+
+    while (pos < size) {
+        uint8_t header = buf[pos];
+        int32_t obuType = (header >> 3) & 0xf;
+        int32_t hasExtension = (header >> 2) & 1;
+        int32_t hasSize = (header >> 1) & 1;
+        int32_t payloadPos = pos + 1 + hasExtension;
+        uint64_t payloadSize = 0;
+
+        if ((header & 0x80) || payloadPos > size) {
+            return false;
+        }
+
+        if (hasSize) {
+            int32_t consumed = 0;
+            if (!readLeb128(buf + payloadPos, size - payloadPos, &consumed, &payloadSize)) {
+                return false;
+            }
+            payloadPos += consumed;
+        } else {
+            payloadSize = size - payloadPos;
+        }
+
+        if (payloadSize > (uint64_t)(size - payloadPos)) {
+            return false;
+        }
+
+        if (obuType == 1 /* OBU_SEQUENCE_HEADER */) {
+            return parseAV1SequenceHeader(buf + payloadPos, (int32_t)payloadSize, width, height);
+        }
+
+        pos = payloadPos + (int32_t)payloadSize;
+    }
+
+    return false;
+}
+
+bool C2RKNaluParser::searchVP9Resolution(
+        uint8_t *buf, int32_t size, int32_t *width, int32_t *height) {
+    C2RKPlainBits br(buf, size);
+
+    if (br.read(2) != 2) {  // frame_marker
+        return false;
+    }
+
+    uint32_t profile = br.read(1);
+    profile |= br.read(1) << 1;
+    if (profile == 3) {
+        br.read(1);  // reserved_zero
+    }
+
+    if (br.read(1)) {  // show_existing_frame
+        return false;
+    }
+
+    if (br.read(1) != 0) {  // frame_type, only key frames carry the size
+        return false;
+    }
+
+    br.read(1);  // show_frame
+    br.read(1);  // error_resilient_mode
+
+    if (br.read(8) != 0x49 || br.read(8) != 0x83 || br.read(8) != 0x42) {
+        return false;
+    }
+
+    if (profile >= 2) {
+        br.read(1);  // ten_or_twelve_bit
+    }
+    if (br.read(3) != 7 /* CS_RGB */) {
+        br.read(1);  // color_range
+        if (profile == 1 || profile == 3) {
+            br.read(3);  // subsampling_x, subsampling_y, reserved_zero
+        }
+    } else if (profile == 1 || profile == 3) {
+        br.read(1);  // reserved_zero
+    }
+
+    int32_t w = (int32_t)br.read(16) + 1;
+    int32_t h = (int32_t)br.read(16) + 1;
+    if (br.overrun) {
+        return false;
+    }
+
+    *width = w;
+    *height = h;
+    return true;
+}
+
+bool C2RKNaluParser::detectResolution(
+        uint8_t *buf, int32_t size, int32_t coding, int32_t *width, int32_t *height) {
+    bool found = false;
+
+    if (buf == nullptr || size <= 0) {
+        return false;
+    }
+
+    switch (coding) {
+    case MPP_VIDEO_CodingAVC:
+        found = searchAVCResolution(buf, size, width, height);
+        break;
+    case MPP_VIDEO_CodingAV1:
+        found = searchAV1Resolution(buf, size, width, height);
+        break;
+    case MPP_VIDEO_CodingVP9:
+        found = searchVP9Resolution(buf, size, width, height);
+        break;
+    default:
+        break;
+    }
+
+    if (found) {
+        Log.D("detected coded resolution %dx%d", *width, *height);
+    }
+
+    return found;
 }
 
 } // namespace android
