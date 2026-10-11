@@ -124,6 +124,8 @@ private:
         int32_t flags;
         int32_t width = 0;
         int32_t height = 0;
+        int32_t left = 0;
+        int32_t top = 0;
         std::shared_ptr<C2GraphicBlock> block;
     };
 
@@ -161,6 +163,7 @@ private:
     int32_t mPixelFormat;
     int32_t mScaleMode;
     bool    mCheckCodedSize;
+    bool    mLoggedXppRect;
     int32_t mFdPerf;
 
     bool mStarted;
@@ -219,6 +222,8 @@ private:
     c2_status_t initDecoder(const std::unique_ptr<C2Work> &work);
     // recreate the mpp context for a new coded size seen in the input after a flush;
     // xpp post-processing hides the size change from the output side
+    // the picture inside an xpp output frame that differs from the stream size
+    C2Rect xppValidRect(const WorkEntry &entry);
     c2_status_t restartDecoderForResolution(
             const std::unique_ptr<C2Work> &work, int32_t width, int32_t height);
     c2_status_t updateDecoderArgs(const std::shared_ptr<C2BlockPool> &pool);

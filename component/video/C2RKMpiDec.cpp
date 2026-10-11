@@ -856,6 +856,7 @@ C2RKMpiDec::C2RKMpiDec(
       mPixelFormat(0),
       mScaleMode(0),
       mCheckCodedSize(true),
+      mLoggedXppRect(false),
       mFdPerf(-1),
       mStarted(false),
       mFlushed(true),
@@ -1822,6 +1823,7 @@ c2_status_t C2RKMpiDec::restartDecoderForResolution(
     mWidth = width;
     mHeight = height;
     mScaleMode = C2_SCALE_MODE_NONE;
+    mLoggedXppRect = false;
 
     err = initDecoder(work);
     if (err != C2_OK) {
@@ -1851,6 +1853,34 @@ c2_status_t C2RKMpiDec::restartDecoderForResolution(
     mDumpService->updateNode(this, mWidth, mHeight);
 
     return C2_OK;
+}
+
+C2Rect C2RKMpiDec::xppValidRect(const WorkEntry &entry) {
+    int32_t width  = entry.width;
+    int32_t height = entry.height;
+    int32_t left   = entry.left;
+    int32_t top    = entry.top;
+
+    // libsculptor keeps the stream's aspect ratio and centres the picture in its
+    // output size; use its offsets if it reports them, otherwise fit the stream into it
+    if (left == 0 && top == 0) {
+        if ((int64_t)entry.width * mHeight > (int64_t)entry.height * mWidth) {
+            width = (int32_t)(((int64_t)entry.height * mWidth / mHeight) & ~1);
+            left  = ((entry.width - width) / 2) & ~1;
+        } else if ((int64_t)entry.width * mHeight < (int64_t)entry.height * mWidth) {
+            height = (int32_t)(((int64_t)entry.width * mHeight / mWidth) & ~1);
+            top    = ((entry.height - height) / 2) & ~1;
+        }
+    }
+
+    if (!mLoggedXppRect) {
+        Log.I("xpp frame %dx%d offset %d,%d for stream %dx%d, crop %dx%d at %d,%d",
+              entry.width, entry.height, entry.left, entry.top, mWidth, mHeight,
+              width, height, left, top);
+        mLoggedXppRect = true;
+    }
+
+    return C2Rect(width, height).at(left, top);
 }
 
 void C2RKMpiDec::setMppPerformance(bool on) {
@@ -1944,10 +1974,12 @@ void C2RKMpiDec::finishWork(
     }
 
     if (block) {
-        int32_t cropWidth  = entry.width  > 0 ? entry.width  : mWidth;
-        int32_t cropHeight = entry.height > 0 ? entry.height : mHeight;
-        c2Buffer = createGraphicBuffer(
-                std::move(block), C2Rect(cropWidth, cropHeight).at(mLeftCorner, mTopCorner));
+        C2Rect crop = C2Rect(mWidth, mHeight).at(mLeftCorner, mTopCorner);
+        if (entry.width > 0 && entry.height > 0
+                && (entry.width != mWidth || entry.height != mHeight)) {
+            crop = xppValidRect(entry);
+        }
+        c2Buffer = createGraphicBuffer(std::move(block), crop);
 
         if (mCodingType == MPP_VIDEO_CodingAVC ||
             mCodingType == MPP_VIDEO_CodingHEVC ||
@@ -2837,6 +2869,8 @@ c2_status_t C2RKMpiDec::getoutframe(WorkEntry *entry) {
     // xpp post-processing may return frames larger than the stream, e.g. AI-PQ upscaled to 1080p
     entry->width  = width;
     entry->height = height;
+    entry->left   = mpp_frame_get_offset_x(frame);
+    entry->top    = mpp_frame_get_offset_y(frame);
 
     if (mCodingType == MPP_VIDEO_CodingAVC ||
         mCodingType == MPP_VIDEO_CodingHEVC ||
