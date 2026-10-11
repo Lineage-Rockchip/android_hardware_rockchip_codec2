@@ -2,7 +2,7 @@ cc_binary {
     name: "android.hardware.media.c2@1.1-service",
     vendor: true,
     relative_install_path: "hw",
-    compile_multilib: "prefer32",
+    compile_multilib: "64",
 
     init_rc: ["android.hardware.media.c2@1.1-service.rc"],
 
@@ -34,7 +34,7 @@ cc_binary {
 prebuilt_etc {
     name: "android.hardware.media.c2@1.1-seccomp_policy",
     vendor: true,
-    compile_multilib: "prefer32",
+    compile_multilib: "64",
     sub_dir: "seccomp_policy",
 
     // If a specific architecture is targeted, multiple choices are not needed.

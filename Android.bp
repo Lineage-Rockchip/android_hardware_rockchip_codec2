@@ -1,3 +1,10 @@
+soong_namespace {
+    imports: [
+        "hardware/rockchip/librga",
+        "vendor/rockchip/rk35xx-common",
+    ],
+}
+
 subdirs = [
     "store",
     "services",
