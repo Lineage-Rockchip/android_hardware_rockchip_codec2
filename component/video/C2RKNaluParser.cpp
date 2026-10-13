@@ -681,13 +681,17 @@ bool C2RKNaluParser::searchAVCResolution(
         if (buf[i] != 0 || buf[i + 1] != 0 || buf[i + 2] != 1) {
             continue;
         }
-        if ((buf[i + 3] & 0x1f) == H264_NALU_TYPE_SPS) {
+        int32_t naluType = buf[i + 3] & 0x1f;
+        if (naluType == H264_NALU_TYPE_SPS) {
             int32_t value = 0;
             if (searchAVCNaluInfo(buf + i, size - i, C2_DETECT_FIELD_RESOLUTION, &value)) {
                 *width = value >> 16;
                 *height = value & 0xffff;
                 return true;
             }
+        } else if (naluType >= 1 && naluType <= 5) {
+            // an SPS comes before the slices of its access unit
+            break;
         }
         i += 2;
     }

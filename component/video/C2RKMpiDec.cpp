@@ -857,6 +857,11 @@ C2RKMpiDec::C2RKMpiDec(
       mScaleMode(0),
       mCheckCodedSize(true),
       mLoggedXppRect(false),
+      mStreamWidth(0),
+      mStreamHeight(0),
+      mPendingStreamWidth(0),
+      mPendingStreamHeight(0),
+      mPendingStreamIndex(-1),
       mFdPerf(-1),
       mStarted(false),
       mFlushed(true),
@@ -1055,6 +1060,7 @@ c2_status_t C2RKMpiDec::onFlush_sm() {
 
         mFlushed = true;
         mCheckCodedSize = true;
+        resetStreamSize();
     }
 
     return C2_OK;
@@ -1824,6 +1830,7 @@ c2_status_t C2RKMpiDec::restartDecoderForResolution(
     mHeight = height;
     mScaleMode = C2_SCALE_MODE_NONE;
     mLoggedXppRect = false;
+    resetStreamSize();
 
     err = initDecoder(work);
     if (err != C2_OK) {
@@ -1855,7 +1862,54 @@ c2_status_t C2RKMpiDec::restartDecoderForResolution(
     return C2_OK;
 }
 
-C2Rect C2RKMpiDec::xppValidRect(const WorkEntry &entry) {
+void C2RKMpiDec::resetStreamSize() {
+    Mutex::Autolock autoLock(mStreamSizeLock);
+    mStreamWidth = 0;
+    mStreamHeight = 0;
+    mPendingStreamIndex = -1;
+}
+
+void C2RKMpiDec::checkInStreamSize(uint8_t *data, size_t size, uint64_t frameIndex) {
+    int32_t width = 0, height = 0;
+
+    if (!C2RKNaluParser::detectResolution(data, size, mCodingType, &width, &height)) {
+        return;
+    }
+
+    Mutex::Autolock autoLock(mStreamSizeLock);
+
+    int32_t curWidth  = mPendingStreamIndex >= 0 ? mPendingStreamWidth
+                        : (mStreamWidth ? mStreamWidth : mWidth);
+    int32_t curHeight = mPendingStreamIndex >= 0 ? mPendingStreamHeight
+                        : (mStreamHeight ? mStreamHeight : mHeight);
+    if (width == curWidth && height == curHeight) {
+        return;
+    }
+
+    Log.I("in-stream size change %dx%d -> %dx%d at frame %lld",
+          curWidth, curHeight, width, height, (long long)frameIndex);
+
+    mPendingStreamWidth = width;
+    mPendingStreamHeight = height;
+    mPendingStreamIndex = (int64_t)frameIndex;
+}
+
+void C2RKMpiDec::getStreamSize(int64_t frameIndex, int32_t *width, int32_t *height) {
+    Mutex::Autolock autoLock(mStreamSizeLock);
+
+    if (mPendingStreamIndex >= 0 && frameIndex >= mPendingStreamIndex) {
+        mStreamWidth = mPendingStreamWidth;
+        mStreamHeight = mPendingStreamHeight;
+        mPendingStreamIndex = -1;
+        mLoggedXppRect = false;
+    }
+
+    *width  = mStreamWidth > 0 ? mStreamWidth : mWidth;
+    *height = mStreamHeight > 0 ? mStreamHeight : mHeight;
+}
+
+C2Rect C2RKMpiDec::xppValidRect(
+        const WorkEntry &entry, int32_t streamWidth, int32_t streamHeight) {
     int32_t width  = entry.width;
     int32_t height = entry.height;
     int32_t left   = entry.left;
@@ -1864,18 +1918,18 @@ C2Rect C2RKMpiDec::xppValidRect(const WorkEntry &entry) {
     // libsculptor keeps the stream's aspect ratio and centres the picture in its
     // output size; use its offsets if it reports them, otherwise fit the stream into it
     if (left == 0 && top == 0) {
-        if ((int64_t)entry.width * mHeight > (int64_t)entry.height * mWidth) {
-            width = (int32_t)(((int64_t)entry.height * mWidth / mHeight) & ~1);
+        if ((int64_t)entry.width * streamHeight > (int64_t)entry.height * streamWidth) {
+            width = (int32_t)(((int64_t)entry.height * streamWidth / streamHeight) & ~1);
             left  = ((entry.width - width) / 2) & ~1;
-        } else if ((int64_t)entry.width * mHeight < (int64_t)entry.height * mWidth) {
-            height = (int32_t)(((int64_t)entry.width * mHeight / mWidth) & ~1);
+        } else if ((int64_t)entry.width * streamHeight < (int64_t)entry.height * streamWidth) {
+            height = (int32_t)(((int64_t)entry.width * streamHeight / streamWidth) & ~1);
             top    = ((entry.height - height) / 2) & ~1;
         }
     }
 
     if (!mLoggedXppRect) {
         Log.I("xpp frame %dx%d offset %d,%d for stream %dx%d, crop %dx%d at %d,%d",
-              entry.width, entry.height, entry.left, entry.top, mWidth, mHeight,
+              entry.width, entry.height, entry.left, entry.top, streamWidth, streamHeight,
               width, height, left, top);
         mLoggedXppRect = true;
     }
@@ -1974,10 +2028,14 @@ void C2RKMpiDec::finishWork(
     }
 
     if (block) {
+        int32_t streamWidth = 0, streamHeight = 0;
+        getStreamSize(entry.frameIndex, &streamWidth, &streamHeight);
+
         C2Rect crop = C2Rect(mWidth, mHeight).at(mLeftCorner, mTopCorner);
         if (entry.width > 0 && entry.height > 0
-                && (entry.width != mWidth || entry.height != mHeight)) {
-            crop = xppValidRect(entry);
+                && (entry.width != mWidth || entry.height != mHeight
+                    || streamWidth != mWidth || streamHeight != mHeight)) {
+            crop = xppValidRect(entry, streamWidth, streamHeight);
         }
         c2Buffer = createGraphicBuffer(std::move(block), crop);
 
@@ -2197,6 +2255,8 @@ void C2RKMpiDec::process(
         if (!(flags & C2FrameData::FLAG_CODEC_CONFIG)) {
             mCheckCodedSize = false;
         }
+    } else if (!mTunneled && !mBufferMode && inSize > 0) {
+        checkInStreamSize(inData, inSize, frameIndex);
     }
 
     if (mFlushed || restarted) {
@@ -2722,6 +2782,7 @@ c2_status_t C2RKMpiDec::getoutframe(WorkEntry *entry) {
         mHorStride = hstride;
         mVerStride = vstride;
         mColorFormat = format;
+        resetStreamSize();
 
         // support fbc mode change on info change stage
         ret = updateFbcModeIfNeeded();

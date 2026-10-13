@@ -164,6 +164,13 @@ private:
     int32_t mScaleMode;
     bool    mCheckCodedSize;
     bool    mLoggedXppRect;
+    // stream size behind xpp output after an in-stream change, 0 while it is mWidth/mHeight
+    Mutex   mStreamSizeLock;
+    int32_t mStreamWidth;
+    int32_t mStreamHeight;
+    int32_t mPendingStreamWidth;
+    int32_t mPendingStreamHeight;
+    int64_t mPendingStreamIndex;
     int32_t mFdPerf;
 
     bool mStarted;
@@ -220,10 +227,14 @@ private:
     void finishWork(const std::unique_ptr<C2Work> &work, WorkEntry entry);
 
     c2_status_t initDecoder(const std::unique_ptr<C2Work> &work);
+    // the picture inside an xpp output frame that differs from the stream size
+    C2Rect xppValidRect(const WorkEntry &entry, int32_t streamWidth, int32_t streamHeight);
+    // in-stream size changes seen in the input, applied from the output frame that carries them
+    void checkInStreamSize(uint8_t *data, size_t size, uint64_t frameIndex);
+    void getStreamSize(int64_t frameIndex, int32_t *width, int32_t *height);
+    void resetStreamSize();
     // recreate the mpp context for a new coded size seen in the input after a flush;
     // xpp post-processing hides the size change from the output side
-    // the picture inside an xpp output frame that differs from the stream size
-    C2Rect xppValidRect(const WorkEntry &entry);
     c2_status_t restartDecoderForResolution(
             const std::unique_ptr<C2Work> &work, int32_t width, int32_t height);
     c2_status_t updateDecoderArgs(const std::shared_ptr<C2BlockPool> &pool);
